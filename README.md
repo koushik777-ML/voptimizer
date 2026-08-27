@@ -87,8 +87,26 @@ Watches everything passively. Feeds data upward. Never makes decisions.
 ### Layer 3 — Decision Layer
 The brain. Takes observations, applies policy, emits action commands. Never moves tensors itself.
 
-- `policy_engine.py` — `PolicyEngine`: maps pressure level → strategy selection
-- `tuner.py` — `WeightTuner`: self-calibrates eviction score weights during a warmup phase, then locks
+- `policy_engine.py` — `PolicyEngine`: maps a memory snapshot, a ledger snapshot and the current `LayerEvent` to a `Decision` — a tuple of `PREFETCH` / `OFFLOAD` / `EVICT_KV` / `CHECKPOINT` actions. A decision is a pure function of its inputs, which is what makes the policy testable without a GPU
+- `tuner.py` — `CostModel` + `BandwidthTuner`: scores eviction candidates, calibrating one measured quantity (effective transfer bandwidth) from observed copies
+
+Band behaviour, before the two preference knobs are applied:
+
+| Pressure | Look-ahead | Checkpointing | Weight offload | KV eviction |
+|---|---|---|---|---|
+| `NORMAL` | full | off | off | off |
+| `MODERATE` | full | on | on | off |
+| `HIGH` | −1 layer | on | on | on |
+| `CRITICAL` | −2 layers | on | on | on |
+
+Look-ahead never reaches zero: the next layer has to be resident for the forward to proceed at all. `latency_tolerance="low"` keeps look-ahead intact and answers pressure by evicting harder instead; `throughput_priority="high"` defers checkpointing to `HIGH`, since recompute is a throughput tax paid every step.
+
+Two rules do most of the work:
+
+- **Reclaim past the release point, not to the band edge.** The monitor de-escalates only once utilization falls a hysteresis margin below the band it entered, so freeing exactly to the edge leaves the level unchanged and the next poll asks for another round.
+- **Never evict what prefetch is about to need.** Layers in the current event's prefetch window have the shortest time to next use; evicting one turns a scheduled async copy into a synchronous stall.
+
+`Decision.shortfall` reports bytes the deficit asked for that no evictable tensor could supply — the budget is unreachable by eviction alone. The action layer cannot fix that, so it is surfaced rather than silently absorbed.
 
 ### Layer 4 — Action Layer
 Executes decisions. Each manager owns one concern only.
@@ -114,16 +132,18 @@ The plan is a prediction, not a contract. Three things break a naive cursor walk
 
 ## Eviction Scoring
 
-When pressure is critical, every managed tensor gets a score. Higher score = evict first.
+Every evictable tensor is scored; higher score is evicted first. The score answers one question — *how many bytes does this free per second of stall I will later pay to get it back?*
 
 ```python
-score = (size_gb       × weight_size)       # bigger = more valuable to free
-      + (time_since_access × weight_age)    # older = safer to evict
-      - (recompute_cost × weight_recompute) # expensive to recompute = keep
-      - (access_frequency × weight_freq)    # frequently used = keep
+restore_s = min(size_bytes / bandwidth, recompute_cost_s)  # cheaper path wins
+score     = (size_bytes / restore_s)   # bytes freed per second of future stall
+          * recency(age)               # recently touched is worth keeping
+          / (1 + log1p(access_count))  # hot tensors are damped, sublinearly
 ```
 
-Weights start at calibrated defaults and self-adjust during a configurable warmup phase based on observed latency and memory freed per action. After warmup, weights lock in for the rest of the run.
+Pinned tensors score exactly zero rather than "very low", so a large enough deficit cannot override a hard constraint from the integration layer.
+
+**This replaces the four self-tuned weights the design originally called for.** Four coupled weights fitted to a few dozen noisy per-step latency samples do not converge, and when the resulting policy misbehaves there is no way to tell whether the model or the weights are wrong. Only one quantity is calibrated: effective transfer bandwidth, measured directly from completed copies, summarized by median (the first copies carry pinning and allocation cost that a mean would keep), and locked after `warmup_steps`. A model that keeps drifting makes two identical pressure situations produce different decisions; a locked one is wrong in a fixed, findable way.
 
 ---
 
@@ -140,7 +160,7 @@ voptimizer/
 ├── planner.py               # ExecutionPlanner — layer order tracer
 │
 ├── policy_engine.py         # PolicyEngine — core decision brain
-├── tuner.py                 # WeightTuner — adaptive score calibration
+├── tuner.py                 # CostModel + BandwidthTuner — eviction scoring
 │
 ├── offload_manager.py       # OffloadManager — GPU ↔ CPU ↔ NVMe
 ├── checkpoint_manager.py    # CheckpointManager — activation recompute
@@ -156,7 +176,8 @@ tests/
 ├── test_planner.py          # trace order, shared modules, prefetch window tests
 ├── test_hooks.py            # event ordering, divergence, pause/detach tests
 ├── test_harness.py          # benchmark harness tests
-├── test_engine.py           # pressure level → action tests
+├── test_policy_engine.py    # pressure level → action tests
+├── test_tuner.py            # bandwidth calibration + eviction scoring tests
 ├── test_offload.py          # GPU ↔ CPU movement tests
 └── test_integration.py      # full wrap() smoke tests
 ```
@@ -253,7 +274,7 @@ This is an active research prototype. The build order follows strict dependency 
 
 - [x] Phase 1 — Foundation: `config.py`, `monitor.py`, `registry.py`, benchmark harness
 - [x] Phase 2 — Integration: `planner.py`, `hooks.py`
-- [ ] Phase 3 — Decision: `policy_engine.py`, `tuner.py`
+- [x] Phase 3 — Decision: `policy_engine.py`, `tuner.py`
 - [ ] Phase 4 — Action: `offload_manager.py`, `kv_scheduler.py`, `checkpoint_manager.py`
 - [ ] Phase 5 — Assembly: `voptimizer.py`, integration tests, benchmarks
 
