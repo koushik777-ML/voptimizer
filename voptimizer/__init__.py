@@ -1,16 +1,25 @@
 """VOptimizer — adaptive VRAM management for PyTorch models.
 
-Phase 1 (foundation) is implemented: configuration, memory observation and the
-tensor ledger. ``VOptimizer.wrap`` arrives with the assembly phase.
+Implemented so far: configuration, memory observation, the tensor ledger,
+execution-order tracing and hook integration. The decision and action layers,
+and with them ``VOptimizer.wrap``, arrive in later phases.
 """
 
 from .config import PressureThresholds, VOptimizerConfig
+from .hooks import HookStats, LayerEvent, ModuleHookManager
 from .monitor import MemorySnapshot, PressureLevel, VRAMMonitor
+from .planner import ExecutionPlan, ExecutionPlanner, PlanStep
 from .registry import Location, RegistrySnapshot, TensorKind, TensorMeta, TensorRegistry
 
 __all__ = [
+    "ExecutionPlan",
+    "ExecutionPlanner",
+    "HookStats",
+    "LayerEvent",
     "Location",
     "MemorySnapshot",
+    "ModuleHookManager",
+    "PlanStep",
     "PressureLevel",
     "PressureThresholds",
     "RegistrySnapshot",

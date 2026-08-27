@@ -82,7 +82,7 @@ Watches everything passively. Feeds data upward. Never makes decisions.
 
 - `monitor.py` — `VRAMMonitor`: polls allocated and reserved bytes, maps utilization to a pressure level with hysteresis
 - `registry.py` — `TensorRegistry`: ledger of every managed tensor with size, location, age, access count, recompute cost. Holds weak references, so the ledger never keeps a tensor alive; metadata outlives the tensor because an offloaded entry still has to be accounted for
-- `planner.py` — `ExecutionPlanner`: traces layer execution order via one dummy forward pass at startup
+- `planner.py` — `ExecutionPlanner`: traces leaf-module execution order via one dummy forward pass at startup. The result is a *sequence of steps*, not a set of modules, so a shared block invoked twice has two distinct sets of successors. `ExecutionPlan.successors(index, window, budget_bytes)` caps look-ahead by bytes as well as by layer count, because a window measured in layers is the wrong unit when layers differ in size
 
 ### Layer 3 — Decision Layer
 The brain. Takes observations, applies policy, emits action commands. Never moves tensors itself.
@@ -100,7 +100,15 @@ Executes decisions. Each manager owns one concern only.
 ### Integration Layer
 The only layer that touches PyTorch hooks. Isolates all hook complexity in one place.
 
-- `hooks.py` — `ModuleHookManager`: attaches `forward_pre_hook` and `forward_hook` to all leaf modules; triggers prefetch before each layer, triggers policy cycle after
+- `hooks.py` — `ModuleHookManager`: attaches `forward_pre_hook` and `forward_hook` to all weight-bearing leaf modules and emits `LayerEvent`s; the pre-hook carries the prefetch window, the post-hook drives the policy cycle
+
+The plan is a prediction, not a contract. Three things break a naive cursor walking it, and the hook layer handles each:
+
+| Hazard | Handling |
+|---|---|
+| Data-dependent control flow, or a forward that raises midway | Root pre-hook resets the cursor each forward; a name mismatch resnaps to the module's planned step and increments `HookStats.mispredictions` |
+| A branch the trace never took | Hooked anyway and reported with `step_index = -1` and `predicted = False`, so divergence is visible rather than silent |
+| Checkpoint recompute replaying a forward during backward | `ModuleHookManager.paused()` suppresses events, so recompute does not count as new steps |
 
 ---
 
@@ -145,6 +153,8 @@ tests/
 ├── test_config.py           # config validation tests
 ├── test_monitor.py          # mock pressure injection + hysteresis tests
 ├── test_registry.py         # ledger bookkeeping tests
+├── test_planner.py          # trace order, shared modules, prefetch window tests
+├── test_hooks.py            # event ordering, divergence, pause/detach tests
 ├── test_harness.py          # benchmark harness tests
 ├── test_engine.py           # pressure level → action tests
 ├── test_offload.py          # GPU ↔ CPU movement tests
@@ -242,7 +252,7 @@ The model runs identically to before. VOptimizer intercepts execution transparen
 This is an active research prototype. The build order follows strict dependency sequencing:
 
 - [x] Phase 1 — Foundation: `config.py`, `monitor.py`, `registry.py`, benchmark harness
-- [ ] Phase 2 — Integration: `planner.py`, `hooks.py`
+- [x] Phase 2 — Integration: `planner.py`, `hooks.py`
 - [ ] Phase 3 — Decision: `policy_engine.py`, `tuner.py`
 - [ ] Phase 4 — Action: `offload_manager.py`, `kv_scheduler.py`, `checkpoint_manager.py`
 - [ ] Phase 5 — Assembly: `voptimizer.py`, integration tests, benchmarks
