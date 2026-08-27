@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voptimizer"
+version = "0.1.0"
+description = "Adaptive VRAM management runtime for PyTorch models"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+dependencies = ["torch>=2.0", "numpy>=1.24", "psutil>=5.9"]
+
+[tool.setuptools]
+packages = ["voptimizer"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.mypy]
+files = ["voptimizer", "benchmarks"]
+ignore_missing_imports = true

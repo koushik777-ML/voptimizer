@@ -61,6 +61,10 @@ The system operates at four pressure levels:
 | `high` | 85–95% | Enable activation checkpointing, stream layers |
 | `critical` | > 95% | Score all tensors, evict top-N by priority score |
 
+Band transitions are damped by a hysteresis margin: utilization must fall meaningfully below a band's entry threshold before the monitor steps back down, otherwise a workload sitting on a boundary thrashes between offloading and reloading the same tensors.
+
+Pressure is measured against **reserved** bytes rather than allocated ones. Freeing a tensor lowers `memory_allocated()` but leaves the caching allocator holding the block, and a new allocation competes with what is reserved — so a policy driven by allocated bytes under-reacts to fragmentation.
+
 ---
 
 ## Architecture
@@ -76,8 +80,8 @@ The developer-facing API. You configure targets here and never touch internals.
 ### Layer 2 — Observation Layer
 Watches everything passively. Feeds data upward. Never makes decisions.
 
-- `monitor.py` — `VRAMMonitor`: polls `torch.cuda.memory_allocated()`, maps to pressure level
-- `registry.py` — `TensorRegistry`: ledger of every managed tensor with size, location, age, recompute cost
+- `monitor.py` — `VRAMMonitor`: polls allocated and reserved bytes, maps utilization to a pressure level with hysteresis
+- `registry.py` — `TensorRegistry`: ledger of every managed tensor with size, location, age, access count, recompute cost. Holds weak references, so the ledger never keeps a tensor alive; metadata outlives the tensor because an offloaded entry still has to be accounted for
 - `planner.py` — `ExecutionPlanner`: traces layer execution order via one dummy forward pass at startup
 
 ### Layer 3 — Decision Layer
@@ -134,8 +138,14 @@ voptimizer/
 ├── checkpoint_manager.py    # CheckpointManager — activation recompute
 └── kv_scheduler.py          # KVCacheScheduler — paged KV blocks
 
+benchmarks/
+└── harness.py               # peak VRAM + tokens/sec measurement, baseline compare
+
 tests/
-├── test_monitor.py          # mock pressure injection tests
+├── test_config.py           # config validation tests
+├── test_monitor.py          # mock pressure injection + hysteresis tests
+├── test_registry.py         # ledger bookkeeping tests
+├── test_harness.py          # benchmark harness tests
 ├── test_engine.py           # pressure level → action tests
 ├── test_offload.py          # GPU ↔ CPU movement tests
 └── test_integration.py      # full wrap() smoke tests
@@ -173,10 +183,10 @@ venv\Scripts\activate
 ### 3. Install dependencies
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 ```
 
-> **Note:** `requirements.txt` will be populated as modules are built. Core dependencies will be `torch`, `numpy`, and `psutil`. No external ML frameworks are required.
+> Core dependencies are `torch`, `numpy`, and `psutil`. No external ML frameworks are required.
 
 ### 4. Verify installation
 
@@ -190,6 +200,14 @@ python -c "import voptimizer; print('VOptimizer ready')"
 pytest tests/ -v
 ```
 
+### 6. Run the benchmark harness
+
+```bash
+python -m benchmarks.harness --layers 8 --hidden 1024 --steps 20
+```
+
+Every memory strategy is judged against a measured baseline: peak reserved VRAM and tokens/sec on the same hardware, with tail latency reported separately. Offload stalls show up in p95, not the median.
+
 ---
 
 ## Usage (Target API)
@@ -200,7 +218,7 @@ from voptimizer import VOptimizer, VOptimizerConfig
 # 1. Define your memory target
 config = VOptimizerConfig(
     target_vram_gb=16.0,
-    latency_tolerance="medium",   # "low" | "medium" | "high"
+    latency_tolerance="medium",  # "low" | "medium" | "high"
     throughput_priority="high",
     warmup_steps=20,
     prefetch_window=2,
@@ -223,7 +241,7 @@ The model runs identically to before. VOptimizer intercepts execution transparen
 
 This is an active research prototype. The build order follows strict dependency sequencing:
 
-- [ ] Phase 1 — Foundation: `config.py`, `monitor.py`, `registry.py`
+- [x] Phase 1 — Foundation: `config.py`, `monitor.py`, `registry.py`, benchmark harness
 - [ ] Phase 2 — Integration: `planner.py`, `hooks.py`
 - [ ] Phase 3 — Decision: `policy_engine.py`, `tuner.py`
 - [ ] Phase 4 — Action: `offload_manager.py`, `kv_scheduler.py`, `checkpoint_manager.py`
@@ -240,6 +258,8 @@ This is an active research prototype. The build order follows strict dependency 
 **Adaptive, not static.** Eviction strategies adjust during warmup based on observed hardware behavior. The system tunes itself to your specific GPU and workload, then locks in the learned behavior.
 
 **Testable by design.** `VRAMMonitor` accepts a `mock_pressure` parameter. Every pressure scenario is reproducible in unit tests without real GPU memory pressure.
+
+**Measured, not asserted.** Offloading is bandwidth-bound — streaming weights over PCIe has a hard throughput floor no scheduler can beat. The win VOptimizer claims is *running at all* within a VRAM budget, at a slowdown you can see in the benchmark output.
 
 ---
 
